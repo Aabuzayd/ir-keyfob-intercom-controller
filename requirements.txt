@@ -1,0 +1,130 @@
+import logging
+import time
+from collections import deque
+
+try:
+    import pigpio
+except ImportError:
+    pigpio = None
+
+
+class IRReceiver:
+    """Simple NEC IR receiver for Raspberry Pi.
+
+    This implementation decodes a standard NEC protocol.
+    The receiver listens for a complete frame and returns the raw code.
+    """
+
+    def __init__(self, pin: int = 17, allowed_codes=None, timeout_ms: int = 1500):
+        self.pin = pin
+        self.allowed_codes = set(allowed_codes or [])
+        self.timeout_ms = timeout_ms
+        self._pi = None
+        self._last_tick = None
+        self._pulse_times = deque()
+        self._in_frame = False
+
+    def start(self, callback):
+        if pigpio is None:
+            logging.warning("pigpio is not installed. IR decoding is unavailable.")
+            return
+
+        self._pi = pigpio.pi()
+        self._pi.set_mode(self.pin, pigpio.INPUT)
+        self._pi.set_pull_up_down(self.pin, pigpio.PUD_UP)
+
+        self._pi.set_watchdog(self.pin, self.timeout_ms)
+        self._pi.callback(self.pin, pigpio.EITHER_EDGE, self._edge_handler)
+
+        logging.info("IR receiver started on GPIO %s", self.pin)
+        self._callback = callback
+
+    def stop(self):
+        if self._pi is not None:
+            self._pi.stop()
+            self._pi = None
+
+    def _edge_handler(self, gpio, level, tick):
+        if self._last_tick is None:
+            self._last_tick = tick
+            return
+
+        delta = tick - self._last_tick
+        self._last_tick = tick
+
+        # Ignore short noise spikes
+        if delta < 100:
+            return
+
+        self._pulse_times.append(delta)
+
+        # NEC frame is roughly 32 bits + leader. Once the line goes quiet for a while,
+        # try to decode the complete burst.
+        if len(self._pulse_times) >= 68:
+            self._decode_and_check()
+
+    def _decode_and_check(self):
+        if self._callback is None:
+            return
+
+        try:
+            code = decode_nec(self._pulse_times)
+            if code is not None:
+                logging.info("Received code: 0x%X", code)
+                self._callback(code)
+        except Exception as exc:
+            logging.exception("IR decode failed: %s", exc)
+        finally:
+            self._pulse_times.clear()
+
+
+def decode_nec(duration_list):
+    """Decode a standard NEC IR code from a list of microsecond pulse lengths."""
+    if len(duration_list) < 68:
+        return None
+
+    # Convert to a bit list using the NEC timing rules.
+    # NEC leader is 9000us mark + 4500us space.
+    # A logical 0 is ~560us mark + 560us space.
+    # A logical 1 is ~560us mark + 1690us space.
+    bits = []
+
+    for idx in range(0, len(duration_list) - 1, 2):
+        mark = duration_list[idx]
+        space = duration_list[idx + 1]
+
+        if mark < 500:
+            continue
+
+        if 500 <= space <= 1100:
+            bits.append(0)
+        elif 1100 <= space <= 2200:
+            bits.append(1)
+        else:
+            # Ignore anything that doesn't fit the NEC pattern.
+            continue
+
+    if len(bits) < 32:
+        return None
+
+    # Store only the first 32 bits; the rest are part of the trailing checksum.
+    value = 0
+    for bit in bits[:32]:
+        value = (value << 1) | bit
+
+    return value
+
+
+def simulate_ir_sequence(code: int):
+    """Return a synthetic NEC-like pulse train for testing without hardware."""
+    # This is intentionally simplified for testing and demonstration.
+    # A real NEC frame would be encoded as a 9ms mark + 4.5ms space,
+    # followed by 32 bits and a bitwise inverse checksum.
+    pulses = []
+    pulses.extend([9000, 4500])
+
+    for bit_index in range(31, -1, -1):
+        bit = (code >> bit_index) & 1
+        pulses.extend([560, 560 if bit == 0 else 1690])
+
+    return pulses
